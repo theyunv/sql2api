@@ -1,0 +1,1111 @@
+package core
+
+import (
+	"bytes"
+	"database/sql"
+	"fmt"
+	"log"
+	"regexp"
+	"sort"
+	"sql2api/tools/stringx"
+	"strings"
+
+	"github.com/chuckpreslar/inflect"
+	"github.com/serenize/snaker"
+)
+
+const (
+	// indent represents the indentation amount for fields. the style guide suggests
+	// two spaces
+	indent = "  "
+
+	// gen api field style
+	fieldStyleToCamelWithStartLower = "sqlApi"
+	fieldStyleToSnake               = "sql_Api"
+
+	// gen api field style
+	apiFileStyleIsAll     = "all"
+	apiFileStyleIsMessage = "message"
+	apiFileStyleIsServer  = "server"
+)
+
+// GenerateSchema generates a api schema from a database connection and a package name.
+// A list of tables to ignore may also be supplied.
+// The returned schema implements the `fmt.Stringer` interface, in order to generate a string
+// representation of a api schema.
+// Do not rely on the structure of the Generated schema to provide any context about
+// the api types. The schema reflects the layout of a api file and should be used
+// to pipe the output of the `Schema.String()` to a file.
+func GenerateSchema(db *sql.DB, table string, ignoreTables []string, ignoreColumns []string, serviceName, goPkg, pkg string, fieldStyle string, apiStyle string, group bool) (*Schema, error) {
+	s := &Schema{}
+
+	dbs, err := dbSchema(db)
+	if nil != err {
+		return nil, err
+	}
+
+	s.Syntax = goPkg
+	s.Group = group
+	s.ApiStyle = apiStyle
+	s.ServiceName = serviceName
+	if "" != pkg {
+		s.Package = pkg
+	}
+	if "" != goPkg {
+		s.GoPackage = goPkg
+	} else {
+		s.GoPackage = "./" + s.Package
+	}
+
+	cols, err := dbColumns(db, dbs, table)
+	if nil != err {
+		return nil, err
+	}
+
+	err = typesFromColumns(s, cols, ignoreTables, ignoreColumns, fieldStyle)
+	if nil != err {
+		return nil, err
+	}
+
+	sort.Sort(s.Imports)
+	sort.Sort(s.Messages)
+	sort.Sort(s.Enums)
+
+	return s, nil
+}
+
+// typesFromColumns creates the appropriate schema properties from a collection of column types.
+func typesFromColumns(s *Schema, cols []Column, ignoreTables []string, ignoreColumns []string, fieldStyle string) error {
+	messageMap := map[string]*Message{}
+	ignoreMap := map[string]bool{}
+	ignoreColumnMap := map[string]bool{}
+	for _, ig := range ignoreTables {
+		ignoreMap[ig] = true
+	}
+	for _, ic := range ignoreColumns {
+		ignoreColumnMap[ic] = true
+	}
+
+	for _, c := range cols {
+		if _, ok := ignoreMap[c.TableName]; ok {
+			continue
+		}
+		if _, ok := ignoreColumnMap[c.ColumnName]; ok {
+			continue
+		}
+
+		messageName := snaker.SnakeToCamel(c.TableName)
+		messageName = inflect.Singularize(messageName)
+
+		msg, ok := messageMap[messageName]
+		if !ok {
+			messageMap[messageName] = &Message{Name: messageName, Comment: c.TableComment, Style: fieldStyle}
+			msg = messageMap[messageName]
+		}
+
+		err := parseColumn(s, msg, c)
+		if nil != err {
+			return err
+		}
+	}
+
+	for _, v := range messageMap {
+		s.Messages = append(s.Messages, v)
+	}
+
+	return nil
+}
+
+func dbSchema(db *sql.DB) (string, error) {
+	var schema string
+
+	err := db.QueryRow("SELECT SCHEMA()").Scan(&schema)
+
+	return schema, err
+}
+
+func dbColumns(db *sql.DB, schema, table string) ([]Column, error) {
+
+	tableArr := strings.Split(table, ",")
+
+	q := "SELECT c.TABLE_NAME, c.COLUMN_NAME, c.IS_NULLABLE, c.DATA_TYPE, " +
+		"c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.COLUMN_TYPE ,c.COLUMN_COMMENT,t.TABLE_COMMENT " +
+		"FROM INFORMATION_SCHEMA.COLUMNS as c  LEFT JOIN  INFORMATION_SCHEMA.TABLES as t  on c.TABLE_NAME = t.TABLE_NAME and  c.TABLE_SCHEMA = t.TABLE_SCHEMA" +
+		" WHERE c.TABLE_SCHEMA = ?"
+
+	if table != "" && table != "*" {
+		q += " AND c.TABLE_NAME IN('" + strings.TrimRight(strings.Join(tableArr, "' ,'"), ",") + "')"
+	}
+
+	q += " ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION"
+
+	rows, err := db.Query(q, schema)
+	defer rows.Close()
+	if nil != err {
+		return nil, err
+	}
+
+	cols := []Column{}
+
+	for rows.Next() {
+		cs := Column{}
+		err := rows.Scan(&cs.TableName, &cs.ColumnName, &cs.IsNullable, &cs.DataType,
+			&cs.CharacterMaximumLength, &cs.NumericPrecision, &cs.NumericScale, &cs.ColumnType, &cs.ColumnComment, &cs.TableComment)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if cs.TableComment == "" {
+			cs.TableComment = stringx.From(cs.TableName).ToCamelWithStartLower()
+		}
+
+		cols = append(cols, cs)
+	}
+	if err := rows.Err(); nil != err {
+		return nil, err
+	}
+
+	return cols, nil
+}
+
+// Schema is a representation of a api schema.
+type Schema struct {
+	Syntax      string
+	ServiceName string
+	GoPackage   string
+	Package     string
+	ApiStyle    string
+	Group       bool
+	Imports     sort.StringSlice
+	Messages    MessageCollection
+	Enums       EnumCollection
+}
+
+// MessageCollection represents a sortable collection of messages.
+type MessageCollection []*Message
+
+func (mc MessageCollection) Len() int {
+	return len(mc)
+}
+
+func (mc MessageCollection) Less(i, j int) bool {
+	return mc[i].Name < mc[j].Name
+}
+
+func (mc MessageCollection) Swap(i, j int) {
+	mc[i], mc[j] = mc[j], mc[i]
+}
+
+// EnumCollection represents a sortable collection of enums.
+type EnumCollection []*Enum
+
+func (ec EnumCollection) Len() int {
+	return len(ec)
+}
+
+func (ec EnumCollection) Less(i, j int) bool {
+	return ec[i].Name < ec[j].Name
+}
+
+func (ec EnumCollection) Swap(i, j int) {
+	ec[i], ec[j] = ec[j], ec[i]
+}
+
+// AppendImport adds an import to a schema if the specific import does not already exist in the schema.
+func (s *Schema) AppendImport(imports string) {
+	shouldAdd := true
+	for _, si := range s.Imports {
+		if si == imports {
+			shouldAdd = false
+			break
+		}
+	}
+
+	if shouldAdd {
+		s.Imports = append(s.Imports, imports)
+	}
+
+}
+
+// String returns a string representation of a Schema.
+func (s *Schema) String() string {
+	buf := new(bytes.Buffer)
+	buf.WriteString(fmt.Sprintf("syntax = \"%s\";\n", s.Syntax))
+	buf.WriteString("\n")
+	if s.ApiStyle == apiFileStyleIsAll || s.ApiStyle == apiFileStyleIsMessage {
+		// buf.WriteString(fmt.Sprintf("option go_package =\"%s\";\n", s.GoPackage))
+		// buf.WriteString("\n")
+		// buf.WriteString(fmt.Sprintf("package %s;\n", s.Package))
+		// buf.WriteString("\n")
+		buf.WriteString("// ------------------------------------ \n")
+		buf.WriteString("// Messages\n")
+		buf.WriteString("// ------------------------------------ \n\n")
+
+		for _, m := range s.Messages {
+			buf.WriteString("//--------------------------------" + m.Comment + "--------------------------------")
+			buf.WriteString("\n")
+			m.GenDefaultMessage(buf)
+			m.GenApiAddReqRespMessage(buf)
+			m.GenApiUpdateReqMessage(buf)
+			m.GenApiDelReqMessage(buf)
+			m.GenApiGetByIdReqMessage(buf)
+			m.GenApiSearchReqMessage(buf)
+		}
+
+		// buf.WriteString("type CommonIdReq {\n")
+		// buf.WriteString("}\n")
+		// buf.WriteString("\n")
+		// buf.WriteString("type CommonStatusResp {\n")
+		// buf.WriteString("}\n")
+
+		if len(s.Enums) > 0 {
+			buf.WriteString("// ------------------------------------ \n")
+			buf.WriteString("// Enums\n")
+			buf.WriteString("// ------------------------------------ \n\n")
+
+			for _, e := range s.Enums {
+				buf.WriteString(fmt.Sprintf("%s\n", e))
+			}
+		}
+	}
+
+	if s.ApiStyle == apiFileStyleIsAll || s.ApiStyle == apiFileStyleIsServer {
+		buf.WriteString("\n")
+		buf.WriteString("// ------------------------------------ \n")
+		buf.WriteString("// api server\n")
+		buf.WriteString("// ------------------------------------ \n\n")
+
+		if s.ApiStyle == apiFileStyleIsServer {
+			for _, m := range s.Messages {
+				importName := strings.ToLower(m.Name)
+				if m.Style == fieldStyleToSnake {
+					importName = stringx.From(m.Name).ToSnake()
+				}
+				buf.WriteString("// 引入 " + importName + " 文件 \n")
+				buf.WriteString("import \"" + importName + ".api\"\n")
+			}
+		}
+
+		if s.Group {
+			buf = GenServerBufByGroup(s, buf)
+		} else {
+			buf = GenServerBuf(s, buf)
+		}
+	}
+
+	return buf.String()
+}
+
+// Enum represents a protocol buffer enumerated type.
+type Enum struct {
+	Name    string
+	Comment string
+	Fields  []EnumField
+}
+
+// String returns a string representation of an Enum.
+func (e *Enum) String() string {
+	buf := new(bytes.Buffer)
+
+	buf.WriteString(fmt.Sprintf("// %s \n", e.Comment))
+	buf.WriteString(fmt.Sprintf("enum %s {\n", e.Name))
+
+	for _, f := range e.Fields {
+		buf.WriteString(fmt.Sprintf("%s%s;\n", indent, f))
+	}
+
+	buf.WriteString("}\n")
+
+	return buf.String()
+}
+
+// AppendField appends an EnumField to an Enum.
+func (e *Enum) AppendField(ef EnumField) error {
+	for _, f := range e.Fields {
+		if f.Tag() == ef.Tag() {
+			return fmt.Errorf("tag `%d` is already in use by field `%s`", ef.Tag(), f.Name())
+		}
+	}
+
+	e.Fields = append(e.Fields, ef)
+
+	return nil
+}
+
+// EnumField represents a field in an enumerated type.
+type EnumField struct {
+	name string
+	tag  int
+}
+
+// NewEnumField constructs an EnumField type.
+func NewEnumField(name string, tag int) EnumField {
+	name = strings.ToUpper(name)
+
+	re := regexp.MustCompile(`([^\w]+)`)
+	name = re.ReplaceAllString(name, "_")
+
+	return EnumField{name, tag}
+}
+
+// String returns a string representation of an Enum.
+func (ef EnumField) String() string {
+	return fmt.Sprintf("%s = %d", ef.name, ef.tag)
+}
+
+// Name returns the name of the enum field.
+func (ef EnumField) Name() string {
+	return ef.name
+}
+
+// Tag returns the identifier tag of the enum field.
+func (ef EnumField) Tag() int {
+	return ef.tag
+}
+
+// newEnumFromStrings creates an enum from a name and a slice of strings that represent the names of each field.
+func newEnumFromStrings(name, comment string, ss []string) (*Enum, error) {
+	enum := &Enum{}
+	enum.Name = name
+	enum.Comment = comment
+
+	for i, s := range ss {
+		err := enum.AppendField(NewEnumField(s, i))
+		if nil != err {
+			return nil, err
+		}
+	}
+
+	return enum, nil
+}
+
+// Service represents a protocol buffer service.
+// TODO: Implement this in a schema.
+type Service struct{}
+
+// Message represents a protocol buffer message.
+type Message struct {
+	Name    string
+	Comment string
+	Fields  []MessageField
+	Style   string
+}
+
+// gen default message
+func (m Message) GenDefaultMessage(buf *bytes.Buffer) {
+	mOrginName := m.Name
+	mOrginFields := m.Fields
+
+	curFields := []MessageField{}
+	var filedTag int
+	for _, field := range m.Fields {
+		if isInSlice([]string{"version", "del_state", "delete_time", "delete_at"}, field.Name) {
+			continue
+		}
+		filedTag++
+		field.tag = filedTag
+		field.Name = stringx.From(field.Name).ToCamelWithStartLower()
+		if m.Style == fieldStyleToSnake {
+			field.Name = stringx.From(field.Name).ToSnake()
+		}
+		if field.Comment == "" {
+			field.Comment = field.Name
+		}
+		curFields = append(curFields, field)
+	}
+	m.Fields = curFields
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+	//resp
+	m.Name = mOrginName + "Resp"
+	curFields2 := []MessageField{
+		// {Typ: "int64", Name: "code", tag: 1, Comment: "状态码"},
+		// {Typ: "string", Name: "message", tag: 2, Comment: "消息"},
+	}
+	var filedTag2 int
+	for _, field := range m.Fields {
+		filedTag2++
+		field.tag = filedTag2
+		field.Name = stringx.From(field.Name).ToCamelWithStartLower()
+		if m.Style == fieldStyleToSnake {
+			field.Name = stringx.From(field.Name).ToSnake()
+		}
+		if field.Comment == "" {
+			field.Comment = field.Name
+		}
+		curFields2 = append(curFields2, field)
+	}
+	m.Fields = curFields2
+
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+}
+
+// gen add req message
+func (m Message) GenApiAddReqRespMessage(buf *bytes.Buffer) {
+	mOrginName := m.Name
+	mOrginFields := m.Fields
+
+	//req
+	m.Name = "Add" + mOrginName + "Req"
+	curFields := []MessageField{}
+	var filedTag int
+	for _, field := range m.Fields {
+		if isInSlice([]string{"id", "create_time", "update_time", "version", "del_state", "delete_time", "create_at", "update_at", "delete_at"}, field.Name) {
+			continue
+		}
+		filedTag++
+		field.tag = filedTag
+		field.Name = stringx.From(field.Name).ToCamelWithStartLower()
+		if m.Style == fieldStyleToSnake {
+			field.Name = stringx.From(field.Name).ToSnake()
+		}
+		if field.Comment == "" {
+			field.Comment = field.Name
+		}
+		field.optType = 1
+		curFields = append(curFields, field)
+	}
+	m.Fields = curFields
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+	//resp
+	m.Name = "Add" + mOrginName + "Resp"
+	m.Fields = []MessageField{}
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+}
+
+// gen add resp message
+func (m Message) GenApiUpdateReqMessage(buf *bytes.Buffer) {
+	mOrginName := m.Name
+	mOrginFields := m.Fields
+
+	m.Name = "Update" + mOrginName + "Req"
+	curFields := []MessageField{
+		// {Typ: "int64", Name: "id", tag: 1, Comment: "Id", optType: 1},
+	}
+	var filedTag = len(curFields)
+	for _, field := range m.Fields {
+		if isInSlice([]string{"create_time", "update_time", "version", "del_state", "delete_time", "create_at", "update_at", "delete_at"}, field.Name) {
+			continue
+		}
+		filedTag++
+		field.tag = filedTag
+		field.Name = stringx.From(field.Name).ToCamelWithStartLower()
+		if m.Style == fieldStyleToSnake {
+			field.Name = stringx.From(field.Name).ToSnake()
+		}
+		if field.Comment == "" {
+			field.Comment = field.Name
+		}
+		field.optType = 1
+		curFields = append(curFields, field)
+	}
+	m.Fields = curFields
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+	//resp
+	m.Name = "Update" + mOrginName + "Resp"
+	m.Fields = []MessageField{}
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+}
+
+// gen add resp message
+func (m Message) GenApiDelReqMessage(buf *bytes.Buffer) {
+	mOrginName := m.Name
+	mOrginFields := m.Fields
+
+	m.Name = "Del" + mOrginName + "Req"
+	curFields := []MessageField{
+		{Typ: "int64", Name: "id", tag: 1, Comment: "Id", optType: 1},
+	}
+	m.Fields = curFields
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+	//resp
+	m.Name = "Del" + mOrginName + "Resp"
+	m.Fields = []MessageField{}
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+}
+
+// gen add resp message
+func (m Message) GenApiGetByIdReqMessage(buf *bytes.Buffer) {
+	mOrginName := m.Name
+	mOrginFields := m.Fields
+
+	m.Name = "Get" + mOrginName + "ByIdReq"
+	curFields := []MessageField{
+		{Typ: "int64", Name: "id", tag: 1, Comment: "Id", optType: 1},
+	}
+	m.Fields = curFields
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+	//resp
+	firstWord := strings.ToLower(string(m.Name[0]))
+	m.Name = "Get" + mOrginName + "ByIdResp"
+
+	name := stringx.From(firstWord + mOrginName[1:]).ToCamelWithStartLower()
+	comment := stringx.From(firstWord + mOrginName[1:]).ToCamelWithStartLower()
+	if m.Style == fieldStyleToSnake {
+		name = stringx.From(firstWord + mOrginName[1:]).ToSnake()
+		comment = stringx.From(firstWord + mOrginName[1:]).ToSnake()
+	}
+	m.Fields = []MessageField{
+		{Typ: mOrginName, Name: name, tag: 1, Comment: comment},
+	}
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+}
+
+// gen add resp message
+func (m Message) GenApiSearchReqMessage(buf *bytes.Buffer) {
+	mOrginName := m.Name
+	mOrginFields := m.Fields
+
+	m.Name = "Search" + mOrginName + "Req"
+	curFields := []MessageField{
+		{Typ: "int64", Name: "pageNo", tag: 1, Comment: "第几页", optType: 1},
+		{Typ: "int64", Name: "pageSize", tag: 2, Comment: "每页多少条", optType: 1},
+		{Typ: "string", Name: "keyWord", tag: 3, Comment: "查询关键词", optType: 1},
+		{Typ: "string", Name: "orderField", tag: 4, Comment: "排序字段", optType: 1, Value: "field"},
+		{Typ: "string", Name: "orderParam", tag: 5, Comment: "排序方法", optType: 1, Value: "order"},
+		{Typ: "int64", Name: "showSub", tag: 6, Comment: "是否显示关联信息", optType: 1},
+	}
+	var filedTag = len(curFields)
+	for _, field := range m.Fields {
+		if isInSlice([]string{"version", "del_state", "delete_time", "delete_at"}, field.Name) {
+			continue
+		}
+		filedTag++
+		field.tag = filedTag
+		field.Name = stringx.From(field.Name).ToCamelWithStartLower()
+		if m.Style == fieldStyleToSnake {
+			field.Name = stringx.From(field.Name).ToSnake()
+		}
+		if field.Comment == "" {
+			field.Comment = field.Name
+		}
+		field.optType = 1
+		curFields = append(curFields, field)
+	}
+	m.Fields = curFields
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+
+	//resp
+	firstWord := strings.ToLower(string(m.Name[0]))
+	m.Name = "Search" + mOrginName + "Resp"
+
+	// name := stringx.From(firstWord + mOrginName[1:]).ToCamelWithStartLower()
+	comment := stringx.From(firstWord + mOrginName[1:]).ToCamelWithStartLower()
+	if m.Style == fieldStyleToSnake {
+		// name = stringx.From(firstWord + mOrginName[1:]).ToSnake()
+		comment = stringx.From(firstWord + mOrginName[1:]).ToSnake()
+	}
+
+	m.Fields = []MessageField{
+		// {Typ: "int64", Name: "code", tag: 1, Comment: "状态码"},
+		// {Typ: "string", Name: "message", tag: 2, Comment: "消息"},
+		{Typ: "int64", Name: "pageNo", tag: 3, Comment: "第几页"},
+		{Typ: "int64", Name: "pageSize", tag: 4, Comment: "每页多少条"},
+		{Typ: "int64", Name: "totalCount", tag: 5, Comment: "共多少条记录"},
+		{Typ: "[]" + mOrginName, Name: "items", tag: 6, Comment: comment},
+	}
+	buf.WriteString(fmt.Sprintf("%s\n", m))
+
+	//reset
+	m.Name = mOrginName
+	m.Fields = mOrginFields
+}
+
+// String returns a string representation of a Message.
+func (m Message) String() string {
+	var buf bytes.Buffer
+
+	buf.WriteString(fmt.Sprintf("type %s {\n", m.Name))
+	for _, f := range m.Fields {
+		buf.WriteString(fmt.Sprintf("%s%s //%s\n", indent, f, f.Comment))
+	}
+	buf.WriteString("}\n")
+
+	return buf.String()
+}
+
+// AppendField appends a message field to a message. If the tag of the message field is in use, an error will be returned.
+func (m *Message) AppendField(mf MessageField) error {
+	for _, f := range m.Fields {
+		if f.Tag() == mf.Tag() {
+			return fmt.Errorf("tag `%d` is already in use by field `%s`", mf.Tag(), f.Name)
+		}
+	}
+
+	m.Fields = append(m.Fields, mf)
+
+	return nil
+}
+
+// MessageField represents the field of a message.
+type MessageField struct {
+	Typ     string
+	Name    string
+	tag     int
+	Comment string
+	optType int
+	Value   string
+}
+
+// NewMessageField creates a new message field.
+func NewMessageField(typ, name string, tag int, comment string, optType int, value string) MessageField {
+	return MessageField{typ, name, tag, comment, optType, value}
+}
+
+// Tag returns the unique numbered tag of the message field.
+func (f MessageField) Tag() int {
+	return f.tag
+}
+
+// String returns a string representation of a message field.
+func (f MessageField) String() string {
+	var optJson string
+	if f.optType == 0 {
+		optJson = fmt.Sprintf(`json:"%s,optional"`, f.Name)
+	} else {
+		if f.Value != "" {
+			optJson = fmt.Sprintf(`form:"%s,optional" json:"%s,optional"`, f.Value, f.Value)
+		} else {
+			optJson = fmt.Sprintf(`form:"%s,optional" json:"%s,optional"`, f.Name, f.Name)
+		}
+	}
+	return fmt.Sprintf("%s %s `%s`", f.Name, f.Typ, optJson)
+}
+
+// Column represents a database column.
+type Column struct {
+	Style                  string
+	TableName              string
+	TableComment           string
+	ColumnName             string
+	IsNullable             string
+	DataType               string
+	CharacterMaximumLength sql.NullInt64
+	NumericPrecision       sql.NullInt64
+	NumericScale           sql.NullInt64
+	ColumnType             string
+	ColumnComment          string
+}
+
+// Table represents a database table.
+type Table struct {
+	TableName  string
+	ColumnName string
+}
+
+// parseColumn parses a column and inserts the relevant fields in the Message. If an enumerated type is encountered, an Enum will
+// be added to the Schema. Returns an error if an incompatible api data type cannot be found for the database column type.
+func parseColumn(s *Schema, msg *Message, col Column) error {
+	typ := strings.ToLower(col.DataType)
+	var fieldType string
+
+	switch typ {
+	case "char", "varchar", "text", "longtext", "mediumtext", "tinytext":
+		fieldType = "string"
+	case "enum", "set":
+		// Parse c.ColumnType to get the enum list
+		enumList := regexp.MustCompile(`[enum|set]\((.+?)\)`).FindStringSubmatch(col.ColumnType)
+		enums := strings.FieldsFunc(enumList[1], func(c rune) bool {
+			cs := string(c)
+			return "," == cs || "'" == cs
+		})
+
+		enumName := inflect.Singularize(snaker.SnakeToCamel(col.TableName)) + snaker.SnakeToCamel(col.ColumnName)
+		enum, err := newEnumFromStrings(enumName, col.ColumnComment, enums)
+		if nil != err {
+			return err
+		}
+
+		s.Enums = append(s.Enums, enum)
+
+		fieldType = enumName
+	case "blob", "mediumblob", "longblob", "varbinary", "binary":
+		fieldType = "bytes"
+	case "date", "time", "datetime", "timestamp":
+		fieldType = "int64"
+	case "bool", "bit":
+		fieldType = "bool"
+	case "tinyint", "smallint", "int", "mediumint", "bigint":
+		fieldType = "int64"
+	case "float", "decimal", "double":
+		fieldType = "float64"
+	}
+
+	if "" == fieldType {
+		return fmt.Errorf("no compatible api type found for `%s`. column: `%s`.`%s`", col.DataType, col.TableName, col.ColumnName)
+	}
+
+	field := NewMessageField(fieldType, col.ColumnName, len(msg.Fields)+1, col.ColumnComment, 0, "")
+
+	err := msg.AppendField(field)
+	if nil != err {
+		return err
+	}
+
+	return nil
+}
+
+func isInSlice(slice []string, s string) bool {
+	for i, _ := range slice {
+		if slice[i] == s {
+			return true
+		}
+	}
+	return false
+}
+
+// gen server buffer
+func GenServerBuf(s *Schema, oldbuf *bytes.Buffer) (buf *bytes.Buffer) {
+	buf = oldbuf
+
+	buf.WriteString("@server ( \n")
+	buf.WriteString(fmt.Sprintf("    prefix: /%s/%s\n", s.ServiceName, s.GoPackage))
+	buf.WriteString(")\n")
+
+	funcTpl := "service " + s.ServiceName + "{ \n\n"
+	for _, m := range s.Messages {
+		funcTpl += "\t //-----------------------" + m.Comment + "----------------------- \n"
+		importName := strings.ToLower(m.Name)
+		if m.Style == fieldStyleToSnake {
+			importName = stringx.From(m.Name).ToSnake()
+		}
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 增加%s
+				description:  "增加%s"
+				tags: "增加%s"
+				title: "增加%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s [POST]
+			)// 增加tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Add"+m.Name+"Req", "Add"+m.Name+"Resp", "Add"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Add%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Add"+m.Name+"Resp",
+		)
+		funcTpl += "\tpost /" + importName + "(Add" + m.Name + "Req) returns (Add" + m.Name + "Resp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 修改%s
+				description:  "修改%s"
+				tags: "修改%s"
+				title: "修改%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s [PUT]
+			)// 修改tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Update"+m.Name+"Req", "Update"+m.Name+"Resp", "Update"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Update%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Update"+m.Name+"Resp",
+		)
+		funcTpl += "\tput /" + importName + "( Update" + m.Name + "Req) returns (Update" + m.Name + "Resp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 删除%s
+				description:  "删除%s"
+				tags: "删除%s"
+				title: "删除%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s [DELETE]
+			)// 删除tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Delete"+m.Name+"Req", "Delete"+m.Name+"Resp", "Delete"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Delete%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Delete"+m.Name+"Resp",
+		)
+		funcTpl += "\tdelete /" + importName + "(Del" + m.Name + "Req) returns (Del" + m.Name + "Resp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 获取%s
+				description:  "获取%s"
+				tags: "获取%s"
+				title: "获取%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s/id [GET]
+			)// 获取tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Get"+m.Name+"ByIdReq", "Get"+m.Name+"ByIdResp", "Get"+m.Name+"ByIdResp", importName)
+		funcTpl += fmt.Sprintf("@handler Get%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Get"+m.Name+"Resp",
+		)
+		funcTpl += "\tget /" + importName + "/id(Get" + m.Name + "ByIdReq) returns (Get" + m.Name + "ByIdResp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 批量查询%s
+				description:  "批量查询%s"
+				tags: "批量查询%s"
+				title: "批量查询%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s/list [POST]
+			)// 批量查询tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Search"+m.Name+"Req", "Search"+m.Name+"Resp", "Search"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Search%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Search"+m.Name+"Resp",
+		)
+		funcTpl += "\tpost /" + importName + "/list(Search" + m.Name + "Req) returns (Search" + m.Name + "Resp); \n"
+	}
+	funcTpl = funcTpl + "\n}"
+	buf.WriteString(funcTpl)
+
+	return
+}
+
+// gen server buffer by group
+func GenServerBufByGroup(s *Schema, oldbuf *bytes.Buffer) (buf *bytes.Buffer) {
+	buf = oldbuf
+
+	for _, m := range s.Messages {
+		buf.WriteString("\n\n")
+		buf.WriteString("@server ( \n")
+		buf.WriteString(fmt.Sprintf("    prefix: /%s/%s\n", s.ServiceName, s.GoPackage))
+		importName := strings.ToLower(m.Name)
+		if m.Style == fieldStyleToSnake {
+			importName = stringx.From(m.Name).ToSnake()
+		}
+		buf.WriteString(fmt.Sprintf("    group:  %s\n", importName))
+		buf.WriteString(")\n")
+
+		funcTpl := "service " + s.ServiceName + "{ \n\n"
+
+		funcTpl += "\t //-----------------------" + m.Comment + "----------------------- \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 增加%s
+				description:  "增加%s"
+				tags: "增加%s"
+				title: "增加%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s [POST]
+			)// 增加tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Add"+m.Name+"Req", "Add"+m.Name+"Resp", "Add"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Add%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Add"+m.Name+"Resp",
+		)
+		funcTpl += "\tpost /" + importName + "(Add" + m.Name + "Req) returns (Add" + m.Name + "Resp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 修改%s
+				description:  "修改%s"
+				tags: "修改%s"
+				title: "修改%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s [PUT]
+			)// 修改tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Update"+m.Name+"Req", "Update"+m.Name+"Resp", "Update"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Update%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Update"+m.Name+"Resp",
+		)
+		funcTpl += "\tput /" + importName + "( Update" + m.Name + "Req) returns (Update" + m.Name + "Resp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 删除%s
+				description:  "删除%s"
+				tags: "删除%s"
+				title: "删除%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s [DELETE]
+			)// 删除tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Delete"+m.Name+"Req", "Delete"+m.Name+"Resp", "Delete"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Delete%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Delete"+m.Name+"Resp",
+		)
+		funcTpl += "\tdelete /" + importName + "(Del" + m.Name + "Req) returns (Del" + m.Name + "Resp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 获取%s
+				description:  "获取%s"
+				tags: "获取%s"
+				title: "获取%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s/id [GET]
+			)// 获取tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Get"+m.Name+"ByIdReq", "Get"+m.Name+"ByIdResp", "Get"+m.Name+"ByIdResp", importName)
+		funcTpl += fmt.Sprintf("@handler Get%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Get"+m.Name+"Resp",
+		)
+		funcTpl += "\tget /" + importName + "/id(Get" + m.Name + "ByIdReq) returns (Get" + m.Name + "ByIdResp); \n"
+		funcTpl += fmt.Sprintf(
+			`
+			@doc(
+				summary: 批量查询%s
+				description:  "批量查询%s"
+				tags: "批量查询%s"
+				title: "批量查询%s"
+				param:  paramname    {object}  %s   true  // 请求名param
+				success: 200    {object}  %s 请求成功
+				failure: 400001 {object}  %s 请求失败
+				router: /%s/list [POST]
+			)// 批量查询tags
+			`, m.Comment, m.Comment, m.Comment, m.Comment, "Search"+m.Name+"Req", "Search"+m.Name+"Resp", "Search"+m.Name+"Resp", importName)
+		funcTpl += fmt.Sprintf("@handler Search%s \n", m.Name)
+		funcTpl += fmt.Sprintf(
+			`
+			/*
+			@respdoc-400 (
+				100101: out of authority
+				100102: %s not exist
+			) // 错误列表Error code
+			*/
+			/*  @respdoc-500 (%s) // 系统Server Error */
+			`, importName, "Search"+m.Name+"Resp",
+		)
+		funcTpl += "\tpost /" + importName + "/list(Search" + m.Name + "Req) returns (Search" + m.Name + "Resp); \n"
+		funcTpl = funcTpl + "\n}"
+		buf.WriteString(funcTpl)
+	}
+
+	return
+}
