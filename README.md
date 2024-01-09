@@ -59,3 +59,60 @@ sql2api -syntax v1 -host localhost -port 3306 -package user -user root -password
 -schema testdatabase -service_name usersrv -field_style sqlApi -api_style server -table user_test,user_test -group true > usersrvdemo2.api
 ```
 
+
+
+#### Use as an imported library
+
+```sh
+go get -u github.com/theyunv/sql2api@latest
+```
+
+```go
+package main
+
+import (
+	"database/sql"
+	"flag"
+	"fmt"
+	"log"
+	"sql2api/core"
+	"strings"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+
+	dbType:= "mysql"
+	connStr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", "root", "root", "127.0.0.1", 3306, "zero-demo")
+	pkg := "my_package"
+	goPkg := "v1"
+	table:= "*"
+	serviceName:="usersrv"
+      fieldStyle := "sqlApi"
+	apiStyle := "all"
+	group := true
+
+
+	db, err := sql.Open(dbType, connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	s, err := core.GenerateSchema(db, table,nil,nil,serviceName, goPkg, pkg,fieldStyle,apiStyle,group)
+
+	if nil != err {
+		log.Fatal(err)
+	}
+
+	if nil != s {
+		fmt.Println(s)
+	}
+}
+```
+
+#### Thanks for schemabuf
+    schemabuf : https://github.com/mcos/schemabuf
+    sql2pb : https://github.com/Mikaelemmmm/sql2pb
+    sql2api : https://github.com/xiafei114/sql2api
